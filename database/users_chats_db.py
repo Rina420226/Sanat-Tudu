@@ -302,18 +302,6 @@ class Database:
         newvalues = { "$set": value }
         return await self.verify_id.update_one(myquery, newvalues)
         
-    async def has_premium_access(self, user_id):
-        user_data = await self.get_user(user_id)
-        if user_data:
-            expiry_time = user_data.get("expiry_time")
-            if expiry_time is None:
-                return False
-            elif isinstance(expiry_time, datetime.datetime) and datetime.datetime.now() <= expiry_time:
-                return True
-            else:
-                await self.users.update_one({"id": user_id}, {"$set": {"expiry_time": None}})
-        return False
-        
     async def update_user(self, user_data):
         await self.users.update_one({"id": user_data["id"]}, {"$set": user_data}, upsert=True)
 
@@ -325,62 +313,6 @@ class Database:
             LOGGER.error(f"Error updating document: {e}")
             return False
             
-    # Premium expired reminder ( This Code Modified By @BOT_OWNER26)
-    async def get_expired(self, current_time):
-        expired_users = []
-        cursor = self.users.find({"expiry_time": {"$lt": current_time}})
-        async for user in cursor:
-            expired_users.append(user)
-        return expired_users
-
-    # Premium expired reminder ( This Code Modified By @BOT_OWNER26)
-    async def get_expiring_soon(self, label, delta):
-        reminder_key = f"reminder_{label}_sent"
-        now = datetime.datetime.utcnow()
-        target_time = now + delta
-        window = timedelta(seconds=30)
-
-        start_range = target_time - window
-        end_range = target_time + window
-
-        reminder_users = []
-        cursor = self.users.find({
-            "expiry_time": {"$gte": start_range, "$lte": end_range},
-            reminder_key: {"$ne": True}
-        })
-
-        async for user in cursor:
-            reminder_users.append(user)
-            await self.users.update_one(
-                {"id": user["id"]}, {"$set": {reminder_key: True}}
-            )
-
-        return reminder_users
-
-    async def remove_premium_access(self, user_id):
-        return await self.update_one(
-            {"id": user_id}, {"$set": {"expiry_time": None}}
-        )
-
-    async def check_trial_status(self, user_id):
-        user_data = await self.get_user(user_id)
-        if user_data:
-            return user_data.get("has_free_trial", False)
-        return False
-
-    async def give_free_trial(self, user_id):
-        user_id = user_id
-        seconds = 5*60         
-        expiry_time = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
-        user_data = {"id": user_id, "expiry_time": expiry_time, "has_free_trial": True}
-        await self.users.update_one({"id": user_id}, {"$set": user_data}, upsert=True)
-
-    async def all_premium_users(self):
-        count = await self.users.count_documents({
-        "expiry_time": {"$gt": datetime.datetime.now()}
-        })
-        return count
-    
     async def get_bot_setting(self, bot_id, setting_key, default_value):
         bot = await self.botcol.find_one({'id': int(bot_id)}, {setting_key: 1, '_id': 0})
         return bot[setting_key] if bot and setting_key in bot else default_value
