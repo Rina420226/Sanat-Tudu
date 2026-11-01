@@ -102,7 +102,7 @@ SPELL_CHECK_REPLY = is_enabled(environ.get("SPELL_CHECK_REPLY", "True"), True)
 SUGGEST_MAX = int(environ.get("SUGGEST_MAX", "5"))                       # max suggestion buttons
 SUGGEST_DELETE_TIME = int(environ.get("SUGGEST_DELETE_TIME", "60"))      # seconds before an unused suggestion message is removed
 NOT_FOUND_DELETE_TIME = int(environ.get("NOT_FOUND_DELETE_TIME", "10"))  # seconds before a "Not Found" message is removed
-SUGGEST_MIN_SCORE = int(environ.get("SUGGEST_MIN_SCORE", "55"))          # RapidFuzz IMDb-title similarity cutoff (0-100)
+SUGGEST_MIN_SCORE = int(environ.get("SUGGEST_MIN_SCORE", "55"))          # RapidFuzz local-database title similarity cutoff (0-100)
 AUTO_SPELL_FIX = is_enabled(environ.get("AUTO_SPELL_FIX", "False"), False)  # True = silently search the closest IMDb title instead of asking
 MAX_LIST_ELM = int(environ.get("MAX_LIST_ELM") or 10) or None # Maximum number of elements in a list (default: 10, set 0 for no limit)
 INDEX_REQ_CHANNEL = int(environ.get('INDEX_REQ_CHANNEL', LOG_CHANNEL))
