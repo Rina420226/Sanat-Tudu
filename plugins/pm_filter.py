@@ -14,7 +14,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerIdInvalid
 from utils import *
-from fuzzywuzzy import process, fuzz
+from rapidfuzz import process, fuzz
 from database.users_chats_db import db
 from database.ia_filterdb import Media, Media2, get_file_details, get_search_results, get_bad_files
 from logging_helper import LOGGER
@@ -36,9 +36,7 @@ BUTTON = {}
 BUTTONS = {}
 FRESH = {}
 SPELL_CHECK = {}
-SUGGEST_CACHE = {}   # "chat_id:message_id" -> {"items": [...], "ts": float}  (live "did you mean" messages)
-_TITLE_CACHE = {"entries": [], "ts": 0.0}   # [(clean_title, frozenset(prefixes))] built from the database
-_TITLE_LOCK = asyncio.Lock()
+SUGGEST_CACHE = {}   # "chat_id:message_id" -> {"items": [...], "ts": float}  (live IMDb suggestions)
 lock = asyncio.Lock()
 
 @Client.on_message(filters.group & filters.text & filters.incoming)
@@ -382,7 +380,6 @@ async def filter_season_cb_handler(client: Client, query: CallbackQuery):
 
 # ======================= "No exact results / Did you mean" callbacks =======================
 # spol#<imdb_id>#<user>   -> IMDb suggestion picked
-# spdb#<user>#<index>     -> database suggestion picked
 # spcancel#<user>         -> Cancel button
 # NOTE: these must stay above the catch-all `cb_handler` (first matching handler wins).
 
@@ -443,20 +440,6 @@ async def advantage_spoll_choker(bot, query):
         await _run_suggestion(bot, query, title)
     except Exception as e:
         LOGGER.error(f"spol callback error: {e}")
-        await _sg_failed(query)
-
-@Client.on_callback_query(filters.regex(r"^spdb#"))
-async def suggestion_db_choice(bot, query):
-    try:
-        _, user, idx = query.data.split('#')
-        if not await _sg_user_ok(query, user):
-            return
-        entry = SUGGEST_CACHE.pop(_sg_key(query.message), None)
-        if not entry:
-            return await _sg_failed(query, "⌛ This suggestion has expired, please search again.")
-        await _run_suggestion(bot, query, entry["items"][int(idx)]["title"])
-    except Exception as e:
-        LOGGER.error(f"spdb callback error: {e}")
         await _sg_failed(query)
 
 @Client.on_callback_query(filters.regex(r"^spcancel#"))
@@ -964,9 +947,9 @@ async def ai_spell_check(chat_id, wrong_name):
     if not movie_list:
         return
     for _ in range(5):
-        closest_match = process.extractOne(wrong_name, movie_list)
-        if not closest_match or closest_match[1] <= 80:
-            return 
+        closest_match = process.extractOne(wrong_name, movie_list, scorer=fuzz.WRatio, score_cutoff=80)
+        if not closest_match:
+            return
         movie = closest_match[0]
         files, offset, total_results = await get_search_results(chat_id=chat_id, query=movie)
         if files:
@@ -999,90 +982,42 @@ def _suggest_title(name):
     t = _suggest_key(t)
     return t if len(t) >= 3 else ""
 
-async def _rebuild_title_index():
-    async with _TITLE_LOCK:
-        if _TITLE_CACHE["entries"] and _time.monotonic() - _TITLE_CACHE["ts"] < SUGGEST_REFRESH:
-            return                                  # somebody else just refreshed it
-        try:
-            titles = set()
-            cols = [Media.collection] + ([Media2.collection] if MULTIPLE_DB else [])
-            for col in cols:
-                n = 0
-                async for doc in col.find({}, {"file_name": 1}):
-                    t = _suggest_title(doc.get("file_name") or "")
-                    if t:
-                        titles.add(t)
-                    n += 1
-                    if n % 2000 == 0:
-                        await asyncio.sleep(0)      # keep the bot responsive while scanning
-            _TITLE_CACHE["entries"] = [(t, frozenset(w[:3] for w in t.split() if len(w) >= 3)) for t in titles]
-            _TITLE_CACHE["ts"] = _time.monotonic()
-        except Exception as e:
-            LOGGER.error(f"title index build failed: {e}")
-
-async def _get_title_index():
-    if not _TITLE_CACHE["entries"]:                 # first use: wait for the build
-        if _TITLE_LOCK.locked():
-            async with _TITLE_LOCK:
-                pass
-        else:
-            await _rebuild_title_index()
-    elif _time.monotonic() - _TITLE_CACHE["ts"] >= SUGGEST_REFRESH and not _TITLE_LOCK.locked():
-        asyncio.create_task(_rebuild_title_index())  # stale: serve old data, refresh in background
-    return _TITLE_CACHE["entries"]
-
-async def _db_fuzzy_titles(query, limit):
-    """Close titles that really exist in the database (typo tolerant)."""
-    q = _suggest_key(query)
-    if len(q) < 3 or limit <= 0:
-        return []
-    entries = await _get_title_index()
-    if not entries:
-        return []
-    def _work():
-        qp = {w[:3] for w in q.split() if len(w) >= 3}
-        cands = [t for t, p in entries if p & qp]
-        if not cands:
-            return []
-        res = process.extract(q, cands, scorer=fuzz.WRatio, limit=limit * 3)
-        return [t for t, score in res if score >= SUGGEST_MIN_SCORE]
-    return await asyncio.to_thread(_work)
-
 async def _build_suggestions(search):
-    """IMDb matches first, then close titles from the database. One entry per title (no variants)."""
+    """Fetch candidate titles from IMDb, then rank them with RapidFuzz."""
     base = _suggest_title(search) or search
-    items, seen = [], []                            # seen = [(title_key, year)]
     try:
         movies = await get_poster(base, bulk=True)
     except Exception as e:
         LOGGER.error(f"IMDb suggestion lookup failed: {e}")
-        movies = None
+        return []
+
+    # IMDb supplies candidate movies; RapidFuzz ranks only those IMDb titles.
+    candidates = []
     for mv in (movies or []):
         title = getattr(mv, "title", None)
         imdb_id = getattr(mv, "imdb_id", None)
+        if title and imdb_id:
+            candidates.append((title, mv))
+    if not candidates:
+        return []
+
+    ranked = process.extract(
+        base,
+        [title for title, _ in candidates],
+        scorer=fuzz.WRatio,
+        limit=SUGGEST_MAX,
+        score_cutoff=SUGGEST_MIN_SCORE,
+    )
+    items, seen = [], set()
+    for title, score, index in ranked:
+        mv = candidates[index][1]
         year = getattr(mv, "year", None)
-        if not title or not imdb_id:
+        imdb_id = getattr(mv, "imdb_id", None)
+        key = (_suggest_key(title), year)
+        if not imdb_id or key in seen:
             continue
-        key = _suggest_key(title)
-        if (key, year) in seen:
-            continue
-        items.append({"title": title, "year": year, "imdb_id": str(imdb_id)})
-        seen.append((key, year))
-        if len(items) >= SUGGEST_MAX:
-            break
-    if SUGGEST_DB_FUZZY and len(items) < SUGGEST_MAX:
-        try:
-            hits = await _db_fuzzy_titles(base, SUGGEST_MAX - len(items))
-        except Exception as e:
-            LOGGER.error(f"database suggestion lookup failed: {e}")
-            hits = []
-        for t in hits:
-            if any(fuzz.ratio(t, k) >= 85 for k, _ in seen):
-                continue
-            items.append({"title": t.title(), "year": None, "imdb_id": None})
-            seen.append((t, None))
-            if len(items) >= SUGGEST_MAX:
-                break
+        seen.add(key)
+        items.append({"title": title, "year": year, "imdb_id": str(imdb_id), "score": score})
     return items
 
 async def _show_not_found(client, bot_msg, orig_msg, title, requester=None):
@@ -1128,7 +1063,7 @@ async def advantage_spell_chok(client, message, m=None, search=None):
     rows = []
     for i, it in enumerate(items):
         label = f"🔍 {it['title']}" + (f" ({it['year']})" if it.get("year") else "")
-        cb = f"spol#{it['imdb_id']}#{user}" if it.get("imdb_id") else f"spdb#{user}#{i}"
+        cb = f"spol#{it['imdb_id']}#{user}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=cb)])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"spcancel#{user}")])
     text = script.SUGGEST_TXT.format(query=_html.escape(message.text or search)[:60])
