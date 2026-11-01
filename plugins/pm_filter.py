@@ -16,7 +16,7 @@ from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerId
 from utils import *
 from rapidfuzz import process, fuzz
 from database.users_chats_db import db
-from database.ia_filterdb import Media, Media2, get_file_details, get_search_results, get_bad_files
+from database.ia_filterdb import Media, Media2, get_file_details, get_search_results, get_bad_files, siletxbotz_fetch_media
 from logging_helper import LOGGER
 from urllib.parse import quote_plus
 from Lucia.util.file_properties import get_name, get_hash, get_media_file_size
@@ -36,7 +36,12 @@ BUTTON = {}
 BUTTONS = {}
 FRESH = {}
 SPELL_CHECK = {}
-SUGGEST_CACHE = {}   # "chat_id:message_id" -> {"items": [...], "ts": float}  (live IMDb suggestions)
+SUGGEST_CACHE = {}   # "chat_id:message_id" -> {"items": [...], "ts": float} (local title suggestions)
+_LOCAL_TITLE_CACHE = []
+_LOCAL_TITLE_CACHE_TS = 0
+_LOCAL_TITLE_CACHE_LOCK = asyncio.Lock()
+_LOCAL_TITLE_CACHE_TTL = 600
+_LOCAL_TITLE_FETCH_LIMIT = 10000
 lock = asyncio.Lock()
 
 @Client.on_message(filters.group & filters.text & filters.incoming)
@@ -425,17 +430,15 @@ async def _run_suggestion(bot, query, title):
 @Client.on_callback_query(filters.regex(r"^spol#"))
 async def advantage_spoll_choker(bot, query):
     try:
-        _, imdb_id, user = query.data.split('#')
+        _, item_index, user = query.data.split('#')
         if not await _sg_user_ok(query, user):
             return
         entry = SUGGEST_CACHE.pop(_sg_key(query.message), None)
-        title = None
-        if entry:                                   # title is already known, no extra IMDb call
-            title = next((i["title"] for i in entry["items"] if i.get("imdb_id") == imdb_id), None)
-        if not title:                               # stateless fallback (e.g. after a bot restart)
-            details = await get_poster(imdb_id, id=True)
-            title = details.get('title') if details else None
-        if not title:
+        if not entry:
+            return await _sg_failed(query, "⚠️ Suggestions expired. Please search again.")
+        try:
+            title = entry["items"][int(item_index)]["title"]
+        except (ValueError, IndexError, KeyError, TypeError):
             return await _sg_failed(query)
         await _run_suggestion(bot, query, title)
     except Exception as e:
@@ -771,16 +774,7 @@ async def auto_filter(client, msg, spoll=False):
             if not files:
                 if not settings["spell_check"]:
                     return await _show_not_found(client, m, message, search, message.from_user)
-                if AUTO_SPELL_FIX:
-                    ai_sts = await m.edit('🤖 ᴘʟᴇᴀꜱᴇ ᴡᴀɪᴛ, ᴀɪ ɪꜱ ᴄʜᴇᴄᴋɪɴɢ ʏᴏᴜʀ ꜱᴘᴇʟʟɪɴɢ...')
-                    is_misspelled = await ai_spell_check(chat_id = message.chat.id,wrong_name=search)
-                    if is_misspelled:
-                        await ai_sts.edit(f'<b><i>✅ Aɪ Sᴜɢɢᴇsᴛᴇᴅ ᴍᴇ<code> {is_misspelled}</code> \nSᴏ Iᴍ Sᴇᴀʀᴄʜɪɴɢ ғᴏʀ <code>{is_misspelled}</code></i></b>')
-                        await asyncio.sleep(2)
-                        message.text = is_misspelled
-                        await ai_sts.delete()
-                        return await auto_filter(client, message)
-                    m = ai_sts   # reuse the same message for the suggestion list
+                # Fast typo correction: rank cached local MongoDB titles with RapidFuzz.
                 return await advantage_spell_chok(client, message, m, search)
         else:
             return
@@ -938,24 +932,6 @@ async def auto_filter(client, msg, spoll=False):
         await save_group_settings(message.chat.id, 'auto_delete', True)
         pass
 
-async def ai_spell_check(chat_id, wrong_name):
-    async def search_movie(wrong_name):
-        search_results = await asyncio.to_thread(imdb.search_movie, wrong_name)
-        movie_list = [movie.title for movie in search_results.titles]
-        return movie_list
-    movie_list = await search_movie(wrong_name)
-    if not movie_list:
-        return
-    for _ in range(5):
-        closest_match = process.extractOne(wrong_name, movie_list, scorer=fuzz.WRatio, score_cutoff=80)
-        if not closest_match:
-            return
-        movie = closest_match[0]
-        files, offset, total_results = await get_search_results(chat_id=chat_id, query=movie)
-        if files:
-            return movie
-        movie_list.remove(movie)
-
 # ======================= "No exact results / Did you mean" engine =======================
 
 _JUNK_RE = re.compile(
@@ -982,43 +958,51 @@ def _suggest_title(name):
     t = _suggest_key(t)
     return t if len(t) >= 3 else ""
 
+async def _get_local_title_index():
+    """Load a bounded local title index once, then reuse it to avoid network/API latency."""
+    global _LOCAL_TITLE_CACHE, _LOCAL_TITLE_CACHE_TS
+    now = _time.monotonic()
+    if _LOCAL_TITLE_CACHE and now - _LOCAL_TITLE_CACHE_TS < _LOCAL_TITLE_CACHE_TTL:
+        return _LOCAL_TITLE_CACHE
+    async with _LOCAL_TITLE_CACHE_LOCK:
+        now = _time.monotonic()
+        if _LOCAL_TITLE_CACHE and now - _LOCAL_TITLE_CACHE_TS < _LOCAL_TITLE_CACHE_TTL:
+            return _LOCAL_TITLE_CACHE
+        try:
+            rows = await siletxbotz_fetch_media(_LOCAL_TITLE_FETCH_LIMIT)
+            titles = set()
+            for row in rows:
+                filename = row.get("file_name", "") if isinstance(row, dict) else getattr(row, "file_name", "")
+                title = _suggest_title(filename)
+                if len(title) >= 3:
+                    titles.add(title)
+            _LOCAL_TITLE_CACHE = sorted(titles)
+            _LOCAL_TITLE_CACHE_TS = _time.monotonic()
+            return _LOCAL_TITLE_CACHE
+        except Exception as e:
+            LOGGER.error(f"Local title index build failed: {e}")
+            return _LOCAL_TITLE_CACHE
+
+
 async def _build_suggestions(search):
-    """Fetch candidate titles from IMDb, then rank them with RapidFuzz."""
-    base = _suggest_title(search) or search
-    try:
-        movies = await get_poster(base, bulk=True)
-    except Exception as e:
-        LOGGER.error(f"IMDb suggestion lookup failed: {e}")
+    """Rank titles already stored in MongoDB using RapidFuzz; no IMDb/network lookup."""
+    base = _suggest_title(search) or _suggest_key(search)
+    if len(base) < 3:
         return []
-
-    # IMDb supplies candidate movies; RapidFuzz ranks only those IMDb titles.
-    candidates = []
-    for mv in (movies or []):
-        title = getattr(mv, "title", None)
-        imdb_id = getattr(mv, "imdb_id", None)
-        if title and imdb_id:
-            candidates.append((title, mv))
-    if not candidates:
+    titles = await _get_local_title_index()
+    if not titles:
         return []
-
     ranked = process.extract(
         base,
-        [title for title, _ in candidates],
+        titles,
         scorer=fuzz.WRatio,
         limit=SUGGEST_MAX,
         score_cutoff=SUGGEST_MIN_SCORE,
     )
-    items, seen = [], set()
-    for title, score, index in ranked:
-        mv = candidates[index][1]
-        year = getattr(mv, "year", None)
-        imdb_id = getattr(mv, "imdb_id", None)
-        key = (_suggest_key(title), year)
-        if not imdb_id or key in seen:
-            continue
-        seen.add(key)
-        items.append({"title": title, "year": year, "imdb_id": str(imdb_id), "score": score})
-    return items
+    return [
+        {"title": title.title(), "score": score}
+        for title, score, _ in ranked
+    ]
 
 async def _show_not_found(client, bot_msg, orig_msg, title, requester=None):
     """'Not Found' notice that deletes itself (and the user's query) after NOT_FOUND_DELETE_TIME seconds."""
@@ -1063,7 +1047,7 @@ async def advantage_spell_chok(client, message, m=None, search=None):
     rows = []
     for i, it in enumerate(items):
         label = f"🔍 {it['title']}" + (f" ({it['year']})" if it.get("year") else "")
-        cb = f"spol#{it['imdb_id']}#{user}"
+        cb = f"spol#{i}#{user}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=cb)])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"spcancel#{user}")])
     text = script.SUGGEST_TXT.format(query=_html.escape(message.text or search)[:60])
