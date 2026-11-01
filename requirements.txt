@@ -26,5 +26,4 @@ dnspython==2.6.1
 python-decouple
 ffmpeg-python==0.2.0
 jinja2
-fuzzywuzzy
-python-Levenshtein==0.27.3
+rapidfuzz
