@@ -6,6 +6,7 @@ import random
 import pytz
 from datetime import datetime, timedelta, date, time
 from database.users_chats_db import db
+from database.refer import referdb
 from pyrogram.errors.exceptions.bad_request_400 import MediaEmpty, PhotoInvalidDimensions, WebpageMediaEmpty
 from Script import script
 import pyrogram
@@ -14,9 +15,9 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerIdInvalid
 from utils import *
-from rapidfuzz import process, fuzz
+from fuzzywuzzy import process, fuzz
 from database.users_chats_db import db
-from database.ia_filterdb import Media, Media2, get_file_details, get_search_results, get_bad_files, siletxbotz_fetch_media
+from database.ia_filterdb import Media, Media2, get_file_details, get_search_results, get_bad_files
 from logging_helper import LOGGER
 from urllib.parse import quote_plus
 from Lucia.util.file_properties import get_name, get_hash, get_media_file_size
@@ -36,12 +37,9 @@ BUTTON = {}
 BUTTONS = {}
 FRESH = {}
 SPELL_CHECK = {}
-SUGGEST_CACHE = {}   # "chat_id:message_id" -> {"items": [...], "ts": float} (local title suggestions)
-_LOCAL_TITLE_CACHE = []
-_LOCAL_TITLE_CACHE_TS = 0
-_LOCAL_TITLE_CACHE_LOCK = asyncio.Lock()
-_LOCAL_TITLE_CACHE_TTL = 600
-_LOCAL_TITLE_FETCH_LIMIT = 10000
+SUGGEST_CACHE = {}   # "chat_id:message_id" -> {"items": [...], "ts": float}  (live "did you mean" messages)
+_TITLE_CACHE = {"entries": [], "ts": 0.0}   # [(clean_title, frozenset(prefixes))] built from the database
+_TITLE_LOCK = asyncio.Lock()
 lock = asyncio.Lock()
 
 @Client.on_message(filters.group & filters.text & filters.incoming)
@@ -106,6 +104,26 @@ async def pm_text(bot, message):
         LOGGER.error(f"An error occurred: {str(e)}")
 
 
+@Client.on_callback_query(filters.regex(r"^reffff"))
+async def refercall(bot, query):
+    btn = [[
+        InlineKeyboardButton('ɪɴᴠɪᴛᴇ ɪɪɴᴋ', url=f'https://telegram.me/share/url?url=https://t.me/{bot.me.username}?start=reff_{query.from_user.id}&text=Hello%21%20Experience%20a%20bot%20that%20offers%20a%20vast%20library%20of%20unlimited%20movies%20and%20series.%20%F0%9F%98%83'),
+        InlineKeyboardButton(f'⏳ {referdb.get_refer_points(query.from_user.id)}', callback_data='ref_point'),
+        InlineKeyboardButton('ʙᴀᴄᴋ', callback_data='premium')
+    ]]
+    reply_markup = InlineKeyboardMarkup(btn)
+    await bot.edit_message_media(
+            query.message.chat.id, 
+            query.message.id, 
+            InputMediaPhoto("https://graph.org/file/1a2e64aee3d4d10edd930.jpg")
+        )
+    await query.message.edit_text(
+        text=f'Hay Your refer link:\n\nhttps://t.me/{bot.me.username}?start=reff_{query.from_user.id}\n\nShare this link with your friends, Each time they join,  you will get 10 refferal points and after 100 points you will get 1 month premium subscription.',
+        reply_markup=reply_markup,
+        parse_mode=enums.ParseMode.HTML
+        )
+    await query.answer()
+	
 async def build_pagination_buttons(btn, total_results, current_offset, next_offset, req, key, settings):
     limit = 10 if settings.get('max_btn') else int(MAX_B_TN)
     total_pages = math.ceil(total_results / limit)
@@ -385,6 +403,7 @@ async def filter_season_cb_handler(client: Client, query: CallbackQuery):
 
 # ======================= "No exact results / Did you mean" callbacks =======================
 # spol#<imdb_id>#<user>   -> IMDb suggestion picked
+# spdb#<user>#<index>     -> database suggestion picked
 # spcancel#<user>         -> Cancel button
 # NOTE: these must stay above the catch-all `cb_handler` (first matching handler wins).
 
@@ -430,19 +449,35 @@ async def _run_suggestion(bot, query, title):
 @Client.on_callback_query(filters.regex(r"^spol#"))
 async def advantage_spoll_choker(bot, query):
     try:
-        _, item_index, user = query.data.split('#')
+        _, imdb_id, user = query.data.split('#')
         if not await _sg_user_ok(query, user):
             return
         entry = SUGGEST_CACHE.pop(_sg_key(query.message), None)
-        if not entry:
-            return await _sg_failed(query, "⚠️ Suggestions expired. Please search again.")
-        try:
-            title = entry["items"][int(item_index)]["title"]
-        except (ValueError, IndexError, KeyError, TypeError):
+        title = None
+        if entry:                                   # title is already known, no extra IMDb call
+            title = next((i["title"] for i in entry["items"] if i.get("imdb_id") == imdb_id), None)
+        if not title:                               # stateless fallback (e.g. after a bot restart)
+            details = await get_poster(imdb_id, id=True)
+            title = details.get('title') if details else None
+        if not title:
             return await _sg_failed(query)
         await _run_suggestion(bot, query, title)
     except Exception as e:
         LOGGER.error(f"spol callback error: {e}")
+        await _sg_failed(query)
+
+@Client.on_callback_query(filters.regex(r"^spdb#"))
+async def suggestion_db_choice(bot, query):
+    try:
+        _, user, idx = query.data.split('#')
+        if not await _sg_user_ok(query, user):
+            return
+        entry = SUGGEST_CACHE.pop(_sg_key(query.message), None)
+        if not entry:
+            return await _sg_failed(query, "⌛ This suggestion has expired, please search again.")
+        await _run_suggestion(bot, query, entry["items"][int(idx)]["title"])
+    except Exception as e:
+        LOGGER.error(f"spdb callback error: {e}")
         await _sg_failed(query)
 
 @Client.on_callback_query(filters.regex(r"^spcancel#"))
@@ -650,6 +685,12 @@ async def cb_handler(client: Client, query: CallbackQuery):
         _, file_id = lazyData.split(":")
         try:
             user_id = query.from_user.id
+            is_premium_user = await db.has_premium_access(user_id)
+            if PAID_STREAM and not is_premium_user:
+                premiumbtn = [[InlineKeyboardButton("𝖡𝗎𝗒 𝖯𝗋𝖾𝗆𝗂𝗎𝗆 ♻️", callback_data='buy')]]
+                await query.answer("<b>📌 ᴛʜɪꜱ ꜰᴇᴀᴛᴜʀᴇ ɪꜱ ᴏɴʟʏ ꜰᴏʀ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀꜱ</b>", show_alert=True)
+                await query.message.reply("<b>📌 ᴛʜɪꜱ ꜰᴇᴀᴛᴜʀᴇ ɪꜱ ᴏɴʟʏ ꜰᴏʀ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀꜱ. ʙᴜʏ ᴘʀᴇᴍɪᴜᴍ ᴛᴏ ᴀᴄᴄᴇꜱꜱ ᴛʜɪꜱ ꜰᴇᴀᴛᴜʀᴇ ✅</b>", reply_markup=InlineKeyboardMarkup(premiumbtn))
+                return
             username =  query.from_user.mention 
             silent_msg = await client.send_cached_media(
                 chat_id=BIN_CHANNEL,
@@ -684,8 +725,13 @@ async def cb_handler(client: Client, query: CallbackQuery):
         buttons = [[
                     InlineKeyboardButton('+ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ +', url=f'http://telegram.me/{temp.U_NAME}?startgroup=true')
                 ],[
+                    InlineKeyboardButton('🧧 ᴛʀᴇɴᴅɪɴɢ ', callback_data="topsearch"),
+                    InlineKeyboardButton('🎟️ ᴜᴘɢʀᴀᴅᴇ ', callback_data="premium"),
+                ],[
                     InlineKeyboardButton('♻️ ᴅᴍᴄᴀ', callback_data='disclaimer'),
-                    InlineKeyboardButton('🎬 ᴍᴏᴠɪᴇ ɢʀᴏᴜᴘ', url=GRP_LNK)
+                    InlineKeyboardButton('👤 ᴀʙᴏᴜᴛ ', callback_data='me')
+                ],[
+                    InlineKeyboardButton('🚫 ᴇᴀʀɴ ᴍᴏɴᴇʏ ᴡɪᴛʜ ʙᴏᴛ 🚫', callback_data="earn")
                 ]]
         reply_markup = InlineKeyboardMarkup(buttons)
         await client.edit_message_media(
@@ -699,6 +745,113 @@ async def cb_handler(client: Client, query: CallbackQuery):
             parse_mode=enums.ParseMode.HTML
         )
   
+    elif query.data == "give_trial":
+        try:
+            user_id = query.from_user.id
+            has_free_trial = await db.check_trial_status(user_id)
+            if has_free_trial:
+                await query.answer("🚸 ʏᴏᴜ'ᴠᴇ ᴀʟʀᴇᴀᴅʏ ᴄʟᴀɪᴍᴇᴅ ʏᴏᴜʀ ꜰʀᴇᴇ ᴛʀɪᴀʟ ᴏɴᴄᴇ !\n\n📌 ᴄʜᴇᴄᴋᴏᴜᴛ ᴏᴜʀ ᴘʟᴀɴꜱ ʙʏ : /plan", show_alert=True)
+                return
+            else:            
+                await db.give_free_trial(user_id)
+                await query.message.reply_text(
+                    text="<b>🥳 ᴄᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴꜱ\n\n🎉 ʏᴏᴜ ᴄᴀɴ ᴜsᴇ ꜰʀᴇᴇ ᴛʀᴀɪʟ ꜰᴏʀ <u>5 ᴍɪɴᴜᴛᴇs</u> ꜰʀᴏᴍ ɴᴏᴡ !</b>",
+                    quote=False,
+                    disable_web_page_preview=True,                  
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💸 ᴄʜᴇᴄᴋᴏᴜᴛ ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴꜱ 💸", callback_data='seeplans')]]))
+                return    
+        except Exception as e:
+            LOGGER.error(e)
+
+    elif query.data == "premium":
+        try:
+            btn = [[
+                InlineKeyboardButton('🧧 ʙᴜʏ ᴘʀᴇᴍɪᴜᴍ 🧧', callback_data='buy'),
+            ],[
+                InlineKeyboardButton('👥 ʀᴇꜰᴇʀ ꜰʀɪᴇɴᴅꜱ', callback_data='reffff'),
+                InlineKeyboardButton('🈚 ꜰʀᴇᴇ ᴛʀɪᴀʟ', callback_data='give_trial')
+            ],[            
+                InlineKeyboardButton('⇋ ʙᴀᴄᴋ ᴛᴏ ʜᴏᴍᴇ ⇋', callback_data='start')
+            ]]
+            reply_markup = InlineKeyboardMarkup(btn)                        
+            await client.edit_message_media(                
+                query.message.chat.id, 
+                query.message.id, 
+                InputMediaPhoto(random.choice(PICS))                       
+            )
+            await query.message.edit_text(
+                text=script.BPREMIUM_TXT,
+                reply_markup=reply_markup,
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception as e:
+            LOGGER.error(e)
+
+    elif query.data == "buy":
+        try:
+            btn = [[ 
+                InlineKeyboardButton('ꜱᴛᴀʀ', callback_data='star'),
+                InlineKeyboardButton('ᴜᴘɪ', callback_data='upi')
+            ],[
+                InlineKeyboardButton('⋞ ʙᴀᴄᴋ', callback_data='premium')
+            ]]
+            reply_markup = InlineKeyboardMarkup(btn)
+            await client.edit_message_media(
+                query.message.chat.id, 
+                query.message.id, 
+                InputMediaPhoto(SUBSCRIPTION)
+	        ) 
+            await query.message.edit_text(
+                text=script.PREMIUM_TEXT.format(query.from_user.mention),
+                reply_markup=reply_markup,
+                parse_mode=enums.ParseMode.HTML
+            ) 
+        except Exception as e:
+            LOGGER.error(e)
+
+    elif query.data == "upi":
+        try:
+            btn = [[ 
+                InlineKeyboardButton('📱 ꜱᴇɴᴅ  ᴘᴀʏᴍᴇɴᴛ ꜱᴄʀᴇᴇɴꜱʜᴏᴛ', url=OWNER_LNK),
+            ],[
+                InlineKeyboardButton('⋞ ʙᴀᴄᴋ', callback_data='buy')
+            ]]
+            reply_markup = InlineKeyboardMarkup(btn)
+            await client.edit_message_media(
+                query.message.chat.id, 
+                query.message.id, 
+                InputMediaPhoto(SUBSCRIPTION)
+	        ) 
+            await query.message.edit_text(
+                text=script.PREMIUM_UPI_TEXT.format(query.from_user.mention),
+                reply_markup=reply_markup,
+                parse_mode=enums.ParseMode.HTML
+            ) 
+        except Exception as e:
+            LOGGER.error(e)
+
+    elif query.data == "star":
+        try:
+            btn = [
+                InlineKeyboardButton(f"{stars}⭐", callback_data=f"buy_{stars}")
+                for stars, days in STAR_PREMIUM_PLANS.items()
+            ]
+            buttons = [btn[i:i + 2] for i in range(0, len(btn), 2)]
+            buttons.append([InlineKeyboardButton("⋞ ʙᴀᴄᴋ", callback_data="buy")])
+            reply_markup = InlineKeyboardMarkup(buttons)
+            await client.edit_message_media(
+                query.message.chat.id, 
+                query.message.id, 
+                InputMediaPhoto(random.choice(PICS))
+			)
+            await query.message.edit_text(
+                text=script.PREMIUM_STAR_TEXT,
+                reply_markup=reply_markup,
+                parse_mode=enums.ParseMode.HTML
+        )
+        except Exception as e:
+            LOGGER.error(e)
+
     elif query.data == "earn":
         try:
             btn = [[ 
@@ -738,6 +891,8 @@ async def cb_handler(client: Client, query: CallbackQuery):
             parse_mode=enums.ParseMode.HTML
         )
 
+    elif query.data == "ref_point":
+        await query.answer(f'You Have: {referdb.get_refer_points(query.from_user.id)} Refferal points.', show_alert=True)
     
     
     elif query.data == "disclaimer":
@@ -774,7 +929,16 @@ async def auto_filter(client, msg, spoll=False):
             if not files:
                 if not settings["spell_check"]:
                     return await _show_not_found(client, m, message, search, message.from_user)
-                # Fast typo correction: rank cached local MongoDB titles with RapidFuzz.
+                if AUTO_SPELL_FIX:
+                    ai_sts = await m.edit('🤖 ᴘʟᴇᴀꜱᴇ ᴡᴀɪᴛ, ᴀɪ ɪꜱ ᴄʜᴇᴄᴋɪɴɢ ʏᴏᴜʀ ꜱᴘᴇʟʟɪɴɢ...')
+                    is_misspelled = await ai_spell_check(chat_id = message.chat.id,wrong_name=search)
+                    if is_misspelled:
+                        await ai_sts.edit(f'<b><i>✅ Aɪ Sᴜɢɢᴇsᴛᴇᴅ ᴍᴇ<code> {is_misspelled}</code> \nSᴏ Iᴍ Sᴇᴀʀᴄʜɪɴɢ ғᴏʀ <code>{is_misspelled}</code></i></b>')
+                        await asyncio.sleep(2)
+                        message.text = is_misspelled
+                        await ai_sts.delete()
+                        return await auto_filter(client, message)
+                    m = ai_sts   # reuse the same message for the suggestion list
                 return await advantage_spell_chok(client, message, m, search)
         else:
             return
@@ -932,6 +1096,24 @@ async def auto_filter(client, msg, spoll=False):
         await save_group_settings(message.chat.id, 'auto_delete', True)
         pass
 
+async def ai_spell_check(chat_id, wrong_name):
+    async def search_movie(wrong_name):
+        search_results = await asyncio.to_thread(imdb.search_movie, wrong_name)
+        movie_list = [movie.title for movie in search_results.titles]
+        return movie_list
+    movie_list = await search_movie(wrong_name)
+    if not movie_list:
+        return
+    for _ in range(5):
+        closest_match = process.extractOne(wrong_name, movie_list)
+        if not closest_match or closest_match[1] <= 80:
+            return 
+        movie = closest_match[0]
+        files, offset, total_results = await get_search_results(chat_id=chat_id, query=movie)
+        if files:
+            return movie
+        movie_list.remove(movie)
+
 # ======================= "No exact results / Did you mean" engine =======================
 
 _JUNK_RE = re.compile(
@@ -958,51 +1140,91 @@ def _suggest_title(name):
     t = _suggest_key(t)
     return t if len(t) >= 3 else ""
 
-async def _get_local_title_index():
-    """Load a bounded local title index once, then reuse it to avoid network/API latency."""
-    global _LOCAL_TITLE_CACHE, _LOCAL_TITLE_CACHE_TS
-    now = _time.monotonic()
-    if _LOCAL_TITLE_CACHE and now - _LOCAL_TITLE_CACHE_TS < _LOCAL_TITLE_CACHE_TTL:
-        return _LOCAL_TITLE_CACHE
-    async with _LOCAL_TITLE_CACHE_LOCK:
-        now = _time.monotonic()
-        if _LOCAL_TITLE_CACHE and now - _LOCAL_TITLE_CACHE_TS < _LOCAL_TITLE_CACHE_TTL:
-            return _LOCAL_TITLE_CACHE
+async def _rebuild_title_index():
+    async with _TITLE_LOCK:
+        if _TITLE_CACHE["entries"] and _time.monotonic() - _TITLE_CACHE["ts"] < SUGGEST_REFRESH:
+            return                                  # somebody else just refreshed it
         try:
-            rows = await siletxbotz_fetch_media(_LOCAL_TITLE_FETCH_LIMIT)
             titles = set()
-            for row in rows:
-                filename = row.get("file_name", "") if isinstance(row, dict) else getattr(row, "file_name", "")
-                title = _suggest_title(filename)
-                if len(title) >= 3:
-                    titles.add(title)
-            _LOCAL_TITLE_CACHE = sorted(titles)
-            _LOCAL_TITLE_CACHE_TS = _time.monotonic()
-            return _LOCAL_TITLE_CACHE
+            cols = [Media.collection] + ([Media2.collection] if MULTIPLE_DB else [])
+            for col in cols:
+                n = 0
+                async for doc in col.find({}, {"file_name": 1}):
+                    t = _suggest_title(doc.get("file_name") or "")
+                    if t:
+                        titles.add(t)
+                    n += 1
+                    if n % 2000 == 0:
+                        await asyncio.sleep(0)      # keep the bot responsive while scanning
+            _TITLE_CACHE["entries"] = [(t, frozenset(w[:3] for w in t.split() if len(w) >= 3)) for t in titles]
+            _TITLE_CACHE["ts"] = _time.monotonic()
         except Exception as e:
-            LOGGER.error(f"Local title index build failed: {e}")
-            return _LOCAL_TITLE_CACHE
+            LOGGER.error(f"title index build failed: {e}")
 
+async def _get_title_index():
+    if not _TITLE_CACHE["entries"]:                 # first use: wait for the build
+        if _TITLE_LOCK.locked():
+            async with _TITLE_LOCK:
+                pass
+        else:
+            await _rebuild_title_index()
+    elif _time.monotonic() - _TITLE_CACHE["ts"] >= SUGGEST_REFRESH and not _TITLE_LOCK.locked():
+        asyncio.create_task(_rebuild_title_index())  # stale: serve old data, refresh in background
+    return _TITLE_CACHE["entries"]
+
+async def _db_fuzzy_titles(query, limit):
+    """Close titles that really exist in the database (typo tolerant)."""
+    q = _suggest_key(query)
+    if len(q) < 3 or limit <= 0:
+        return []
+    entries = await _get_title_index()
+    if not entries:
+        return []
+    def _work():
+        qp = {w[:3] for w in q.split() if len(w) >= 3}
+        cands = [t for t, p in entries if p & qp]
+        if not cands:
+            return []
+        res = process.extract(q, cands, scorer=fuzz.WRatio, limit=limit * 3)
+        return [t for t, score in res if score >= SUGGEST_MIN_SCORE]
+    return await asyncio.to_thread(_work)
 
 async def _build_suggestions(search):
-    """Rank titles already stored in MongoDB using RapidFuzz; no IMDb/network lookup."""
-    base = _suggest_title(search) or _suggest_key(search)
-    if len(base) < 3:
-        return []
-    titles = await _get_local_title_index()
-    if not titles:
-        return []
-    ranked = process.extract(
-        base,
-        titles,
-        scorer=fuzz.WRatio,
-        limit=SUGGEST_MAX,
-        score_cutoff=SUGGEST_MIN_SCORE,
-    )
-    return [
-        {"title": title.title(), "score": score}
-        for title, score, _ in ranked
-    ]
+    """IMDb matches first, then close titles from the database. One entry per title (no variants)."""
+    base = _suggest_title(search) or search
+    items, seen = [], []                            # seen = [(title_key, year)]
+    try:
+        movies = await get_poster(base, bulk=True)
+    except Exception as e:
+        LOGGER.error(f"IMDb suggestion lookup failed: {e}")
+        movies = None
+    for mv in (movies or []):
+        title = getattr(mv, "title", None)
+        imdb_id = getattr(mv, "imdb_id", None)
+        year = getattr(mv, "year", None)
+        if not title or not imdb_id:
+            continue
+        key = _suggest_key(title)
+        if (key, year) in seen:
+            continue
+        items.append({"title": title, "year": year, "imdb_id": str(imdb_id)})
+        seen.append((key, year))
+        if len(items) >= SUGGEST_MAX:
+            break
+    if SUGGEST_DB_FUZZY and len(items) < SUGGEST_MAX:
+        try:
+            hits = await _db_fuzzy_titles(base, SUGGEST_MAX - len(items))
+        except Exception as e:
+            LOGGER.error(f"database suggestion lookup failed: {e}")
+            hits = []
+        for t in hits:
+            if any(fuzz.ratio(t, k) >= 85 for k, _ in seen):
+                continue
+            items.append({"title": t.title(), "year": None, "imdb_id": None})
+            seen.append((t, None))
+            if len(items) >= SUGGEST_MAX:
+                break
+    return items
 
 async def _show_not_found(client, bot_msg, orig_msg, title, requester=None):
     """'Not Found' notice that deletes itself (and the user's query) after NOT_FOUND_DELETE_TIME seconds."""
@@ -1047,7 +1269,7 @@ async def advantage_spell_chok(client, message, m=None, search=None):
     rows = []
     for i, it in enumerate(items):
         label = f"🔍 {it['title']}" + (f" ({it['year']})" if it.get("year") else "")
-        cb = f"spol#{i}#{user}"
+        cb = f"spol#{it['imdb_id']}#{user}" if it.get("imdb_id") else f"spdb#{user}#{i}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=cb)])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"spcancel#{user}")])
     text = script.SUGGEST_TXT.format(query=_html.escape(message.text or search)[:60])
