@@ -17,7 +17,7 @@ from database.users_chats_db import db
 from info import *
 from utils import temp
 from Script import script
-from plugins import web_server
+from plugins import web_server, check_expired_premium
 from Lucia.Bot import SilentX
 from Lucia.util.keepalive import ping_server
 from Lucia.Bot.clients import initialize_clients
@@ -133,6 +133,7 @@ async def SilentXBotz_start():
     temp.B_NAME = me.first_name
     temp.B_LINK = me.mention
     SilentX.username = "@" + me.username
+    SilentX.loop.create_task(check_expired_premium(SilentX))
     LOGGER.info(
         "%s with Pyrofork v%s (Layer %s) started on @%s.",
         me.first_name,
